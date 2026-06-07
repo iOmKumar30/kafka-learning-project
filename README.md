@@ -673,3 +673,454 @@ If you see all three Fraud Service instances actively processing events, then yo
 - Parallel Event Processing
 
 At this point, you've moved from a simple producer-consumer setup to a scalable event-driven architecture capable of handling significantly higher throughput.
+
+# 🚀 Phase 4: Retry Queues & Dead-Letter Queues (DLQ)
+
+## The Concept: Handling Poison Pills
+
+In a real-world event-driven system, not every message can be processed successfully.
+
+Imagine your Notification Service receives:
+
+* A malformed event
+* Missing user information
+* A temporary database outage
+* An email provider outage (SendGrid, SES, etc.)
+
+If the consumer crashes while processing the message, Kafka will deliver the same message again after restart.
+
+This creates a dangerous situation known as **Head-of-Line Blocking**.
+
+---
+
+## ☠️ The Poison Pill Problem
+
+```text
+Topic: user-events
+
+Message A ✅
+Message B ❌ (Poison Pill)
+Message C ✅
+Message D ✅
+```
+
+If Message B always crashes the consumer:
+
+```text
+Consumer starts
+      ↓
+Reads Message B
+      ↓
+Crashes
+      ↓
+Restarts
+      ↓
+Reads Message B again
+      ↓
+Crashes
+```
+
+The consumer never reaches:
+
+```text
+Message C
+Message D
+```
+
+Even though they are perfectly valid.
+
+---
+
+## Why Not Just Ignore the Error?
+
+You could write:
+
+```python
+try:
+    process_message()
+except:
+    pass
+```
+
+But now the message is silently discarded.
+
+```text
+❌ Data Lost
+```
+
+Not acceptable in production systems.
+
+---
+
+# 🏢 Enterprise Solution
+
+Instead of crashing or dropping the message:
+
+### Step 1
+
+Catch the exception.
+
+```text
+Processing Failed
+```
+
+↓
+
+### Step 2
+
+Retry a few times.
+
+```text
+Attempt 1
+Attempt 2
+Attempt 3
+```
+
+↓
+
+### Step 3
+
+If it still fails, move it to a dedicated topic:
+
+```text
+user-events-dlq
+```
+
+↓
+
+### Step 4
+
+Commit the original offset and continue processing.
+
+```text
+Healthy messages keep flowing.
+```
+
+---
+
+# Architecture
+
+```text
+                 user-events
+                      │
+                      ▼
+           Notification Service
+                      │
+          ┌───────────┴───────────┐
+          │                       │
+          ▼                       ▼
+      Success                 Failure
+          │                       │
+          ▼                       ▼
+    Process Event          Retry 3 Times
+                                  │
+                                  ▼
+                           user-events-dlq
+```
+
+---
+
+# Step 1: Create the DLQ Topic
+
+Open Kafka UI:
+
+```text
+http://localhost:8080
+```
+
+Create a new topic:
+
+```text
+user-events-dlq
+```
+
+Recommended settings:
+
+```text
+Topic Name     : user-events-dlq
+Partitions     : 1
+Replication    : 1
+```
+
+---
+
+## Why Only 1 Partition?
+
+DLQs typically receive much lower traffic than production topics.
+
+```text
+Normal Traffic
+      ↓
+user-events
+```
+
+```text
+Failed Messages
+      ↓
+user-events-dlq
+```
+
+For this project, a single partition is sufficient.
+
+---
+
+# Step 2: Upgrade the Notification Service
+
+Previously, the service only acted as a:
+
+```text
+Consumer
+```
+
+Now it must become both a:
+
+```text
+Consumer
+      +
+Producer
+```
+
+Why?
+
+Because when processing fails, it needs to publish the failed event into:
+
+```text
+user-events-dlq
+```
+
+---
+
+# Testing the Happy Path
+
+Start the updated service:
+
+```bash
+python -m consumers.notification_svc.main
+```
+
+---
+
+Send a healthy event:
+
+```bash
+curl -X POST \
+  'http://localhost:8000/events' \
+  -H 'Content-Type: application/json' \
+  -d '{"user_id":"101","action":"SIGNUP"}'
+```
+
+Expected output:
+
+```text
+📩 Processing Event
+✅ Successfully sent notification
+```
+
+---
+
+# Testing the Poison Pill
+
+Send a deliberately broken event:
+
+```bash
+curl -X POST \
+  'http://localhost:8000/events' \
+  -H 'Content-Type: application/json' \
+  -d '{"user_id":"999","action":"CRASH"}'
+```
+
+---
+
+## Expected Behavior
+
+```text
+Attempt 1 ❌
+```
+
+Wait 1 second
+
+```text
+Attempt 2 ❌
+```
+
+Wait 1 second
+
+```text
+Attempt 3 ❌
+```
+
+Still failing?
+
+```text
+➡️ Routing message to DLQ
+```
+
+---
+
+### Example Flow
+
+```text
+user-events
+      │
+      ▼
+Notification Service
+      │
+      ▼
+CRASH Event
+      │
+      ▼
+Retry #1
+      │
+      ▼
+Retry #2
+      │
+      ▼
+Retry #3
+      │
+      ▼
+user-events-dlq
+```
+
+The consumer remains alive and continues processing new events.
+
+---
+
+# Inspecting the DLQ
+
+Open Kafka UI and navigate to:
+
+```text
+Topics
+  └── user-events-dlq
+```
+
+You should see the failed event stored safely.
+
+Example:
+
+```json
+{
+  "user_id": "999",
+  "action": "CRASH",
+  "error": "Simulated processing failure"
+}
+```
+
+Nothing is lost.
+
+The event can be:
+
+* Investigated
+* Reprocessed
+* Fixed manually
+* Replayed later
+
+---
+
+# The Most Important Change
+
+## Manual Offset Management
+
+Instead of:
+
+```python
+enable_auto_commit=True
+```
+
+we switch to:
+
+```python
+enable_auto_commit=False
+```
+
+---
+
+## What Auto Commit Does
+
+Kafka assumes:
+
+```text
+You fetched the message
+        ↓
+Therefore you processed it
+```
+
+which is not always true.
+
+---
+
+### Dangerous Scenario
+
+```text
+Consumer receives message
+        ↓
+Starts processing
+        ↓
+Server crashes
+```
+
+But Kafka already committed the offset.
+
+```text
+❌ Message Lost Forever
+```
+
+---
+
+# Manual Commit Strategy
+
+With:
+
+```python
+enable_auto_commit=False
+```
+
+Kafka waits for us to explicitly say:
+
+```python
+await consumer.commit()
+```
+
+Only after:
+
+```text
+Processing succeeded
+OR
+Message sent to DLQ
+```
+
+do we commit the offset.
+
+---
+
+# Delivery Guarantee
+
+This gives us:
+
+```text
+At-Least-Once Delivery
+```
+
+Meaning:
+
+> Every message will be processed at least once, even if the service crashes during processing.
+
+---
+
+# Why This Matters
+
+By introducing:
+
+* Retries
+* Dead-Letter Queues
+* Manual Offset Commits
+
+we make the system:
+
+✅ Fault tolerant
+✅ Self-healing
+✅ Resilient to transient failures
+✅ Safe from poison pills
+✅ Ready for production-style workloads
+
+At this point, your Kafka architecture has evolved from a simple producer-consumer demo into a robust event-driven system capable of handling real-world failures gracefully.
